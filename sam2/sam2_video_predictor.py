@@ -12,7 +12,13 @@ import torch
 from tqdm import tqdm
 
 from sam2.modeling.sam2_base import NO_OBJ_SCORE, SAM2Base
-from sam2.utils.misc import concat_points, fill_holes_in_mask_scores, load_video_frames
+from sam2.utils.misc import (
+    concat_points,
+    fill_holes_in_mask_scores,
+    load_video_frames,
+    load_video_frames_with_cache,
+    LRUCache,
+)
 
 
 class SAM2VideoPredictor(SAM2Base):
@@ -43,19 +49,23 @@ class SAM2VideoPredictor(SAM2Base):
         offload_video_to_cpu=False,
         offload_state_to_cpu=False,
         async_loading_frames=False,
+        image_cache_size=500,  # Adjust cache size as needed
+        image_feature_cache_size=10,  # Adjust cache size as needed
     ):
         """Initialize an inference state."""
         compute_device = self.device  # device of the model
-        images, video_height, video_width = load_video_frames(
+        # Load video frames using the caching mechanism
+        frame_loader = load_video_frames_with_cache(
             video_path=video_path,
             image_size=self.image_size,
             offload_video_to_cpu=offload_video_to_cpu,
-            async_loading_frames=async_loading_frames,
+            cache_size=image_cache_size,
             compute_device=compute_device,
         )
+        # Initialize inference_state and store the frame loader
         inference_state = {}
-        inference_state["images"] = images
-        inference_state["num_frames"] = len(images)
+        inference_state["images"] = frame_loader
+        inference_state["num_frames"] = frame_loader.num_frames
         # whether to offload the video frames to CPU memory
         # turning on this option saves the GPU memory with only a very small overhead
         inference_state["offload_video_to_cpu"] = offload_video_to_cpu
@@ -65,8 +75,8 @@ class SAM2VideoPredictor(SAM2Base):
         # and from 24 to 21 when tracking two objects)
         inference_state["offload_state_to_cpu"] = offload_state_to_cpu
         # the original video height and width, used for resizing final output scores
-        inference_state["video_height"] = video_height
-        inference_state["video_width"] = video_width
+        inference_state["video_height"] = frame_loader.video_height
+        inference_state["video_width"] = frame_loader.video_width
         inference_state["device"] = compute_device
         if offload_state_to_cpu:
             inference_state["storage_device"] = torch.device("cpu")
@@ -76,7 +86,7 @@ class SAM2VideoPredictor(SAM2Base):
         inference_state["point_inputs_per_obj"] = {}
         inference_state["mask_inputs_per_obj"] = {}
         # visual features on a small number of recently visited frames for quick interactions
-        inference_state["cached_features"] = {}
+        inference_state["cached_features"] = LRUCache(capacity=image_feature_cache_size)
         # values that don't change across frames (so we only need to hold one copy of them)
         inference_state["constants"] = {}
         # mapping between client-side object id and model-side object index
@@ -790,20 +800,24 @@ class SAM2VideoPredictor(SAM2Base):
 
     def _get_image_feature(self, inference_state, frame_idx, batch_size):
         """Compute the image features on a given frame."""
-        # Look up in the cache first
-        image, backbone_out = inference_state["cached_features"].get(
-            frame_idx, (None, None)
-        )
+        # Look up in the cache first (LRU cache)
+        cached = inference_state["cached_features"].get(frame_idx)
+        image, backbone_out = cached if cached is not None else (None, None)
         if backbone_out is None:
             # Cache miss -- we will run inference on a single image
             device = inference_state["device"]
-            image = inference_state["images"][frame_idx].to(device).float().unsqueeze(0)
+            image = (
+                inference_state["images"]
+                .get_frame(frame_idx)
+                .to(device)
+                .float()
+                .unsqueeze(0)
+            )
             backbone_out = self.forward_image(image)
-            # Cache the most recent frame's feature (for repeated interactions with
-            # a frame; we can use an LRU cache for more frames in the future).
-            inference_state["cached_features"] = {frame_idx: (image, backbone_out)}
+            # Cache the most recent frame's feature
+            inference_state["cached_features"].put(frame_idx, (image, backbone_out))
 
-        # expand the features to have the same dimension as the number of objects
+        # Expand the features to have the same dimension as the number of objects
         expanded_image = image.expand(batch_size, -1, -1, -1)
         expanded_backbone_out = {
             "backbone_fpn": backbone_out["backbone_fpn"].copy(),
