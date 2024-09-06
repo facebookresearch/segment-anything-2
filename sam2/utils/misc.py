@@ -6,11 +6,13 @@
 
 import os
 import warnings
+from collections import OrderedDict
 from threading import Thread
 
 import numpy as np
 import torch
 from PIL import Image
+from torchvision import transforms
 from tqdm import tqdm
 
 
@@ -234,6 +236,147 @@ def load_video_frames(
     images -= img_mean
     images /= img_std
     return images, video_height, video_width
+
+
+class LRUCache:
+    def __init__(self, capacity: int):
+        self.cache = OrderedDict()
+        self.capacity = capacity
+
+    def get(self, key):
+        if key not in self.cache:
+            return None
+        # Move the key to the end to show that it was recently used
+        self.cache.move_to_end(key)
+        return self.cache[key]
+
+    def put(self, key, value):
+        # Insert the item or update the existing one
+        if key in self.cache:
+            self.cache.move_to_end(key)
+        self.cache[key] = value
+        # If the cache exceeds the capacity, pop the first (least recently used) item
+        if len(self.cache) > self.capacity:
+            self.cache.popitem(last=False)
+
+
+class VideoFrameLoader:
+    def __init__(
+        self,
+        img_paths,
+        image_size,
+        img_mean,
+        img_std,
+        offload_to_cpu,
+        compute_device,
+        cache_size=100,
+    ):
+        """
+        Initialize the video frame loader with image paths, image size, mean, std, and caching options.
+        """
+        self.img_paths = img_paths
+        self.image_size = image_size
+        self.img_mean = img_mean
+        self.img_std = img_std
+        self.offload_to_cpu = offload_to_cpu
+        self.device = compute_device
+        self.num_frames = len(img_paths)
+        self.cache_size = cache_size
+
+        # Initialize image transformations
+        self.transform = transforms.Compose(
+            [
+                transforms.Resize((image_size, image_size)),
+                transforms.ToTensor(),
+                transforms.Normalize(mean=img_mean, std=img_std),
+            ]
+        )
+
+        # Create an LRU cache for frames
+        self.frame_cache = LRUCache(capacity=self.cache_size)
+        self.video_width, self.video_height = self._get_frame_dimensions()
+
+    def _get_frame_dimensions(self):
+        """Get the dimensions of the frames (width, height)."""
+        img = Image.open(self.img_paths[0])
+        return img.width, img.height
+
+    def _load_frame(self, idx):
+        """Internal method to load and preprocess a frame."""
+        img = Image.open(self.img_paths[idx]).convert("RGB")
+        img_tensor = self.transform(img)
+        return img_tensor
+
+    def get_frame(self, idx):
+        """Fetch a frame using the LRU cache or load it if it's not cached."""
+        # Check if frame is in cache
+        cached_frame = self.frame_cache.get(idx)
+        if cached_frame is not None:
+            return cached_frame
+
+        # Load the frame if it's not in cache
+        frame = self._load_frame(idx)
+
+        # Add the frame to the cache
+        self.frame_cache.put(idx, frame)
+
+        # Move to device if not offloading to CPU
+        if not self.offload_to_cpu:
+            frame = frame.to(self.device)
+
+        return frame
+
+
+def load_video_frames_with_cache(
+    video_path,
+    image_size,
+    offload_video_to_cpu,
+    cache_size=100,
+    img_mean=(0.485, 0.456, 0.406),
+    img_std=(0.229, 0.224, 0.225),
+    compute_device=torch.device("cuda"),
+):
+    """
+    Load video frames from a directory of JPEG files with LRU cache for high efficiency.
+    The frames are resized to image_size x image_size and normalized.
+    """
+    # Ensure video_path is a directory
+    if isinstance(video_path, str) and os.path.isdir(video_path):
+        jpg_folder = video_path
+    else:
+        raise NotImplementedError(
+            "Only JPEG frames are supported. Use ffmpeg to extract frames if needed."
+        )
+
+    # Get sorted list of JPEG frame files
+    frame_names = [
+        p
+        for p in os.listdir(jpg_folder)
+        if os.path.splitext(p)[-1] in [".jpg", ".jpeg", ".JPG", ".JPEG"]
+    ]
+    frame_names.sort(key=lambda p: int(os.path.splitext(p)[0]))
+
+    # Ensure there are frames available
+    num_frames = len(frame_names)
+    if num_frames == 0:
+        raise RuntimeError(f"No images found in {jpg_folder}")
+
+    # Generate full paths to frames
+    img_paths = [os.path.join(jpg_folder, frame_name) for frame_name in frame_names]
+
+    # Initialize VideoFrameLoader with LRU cache
+    frame_loader = VideoFrameLoader(
+        img_paths=img_paths,
+        image_size=image_size,
+        img_mean=img_mean,
+        img_std=img_std,
+        offload_to_cpu=offload_video_to_cpu,
+        compute_device=compute_device,
+        cache_size=cache_size,  # Set the cache size dynamically
+    )
+
+    # Return the frame loader and the total number of frames
+    return frame_loader
 
 
 def fill_holes_in_mask_scores(mask, max_area):
